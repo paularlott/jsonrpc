@@ -79,6 +79,15 @@ func runChildServer() {
 		go os.Exit(0)
 		return nil, nil
 	})
+	// "env" returns the value of a named environment variable, used to verify
+	// WithEnv/WithExtraEnv propagate the expected variables to the child.
+	s.Handle("env", func(ctx context.Context, params json.RawMessage) (any, error) {
+		var name string
+		if err := jsonrpc.Unmarshal(params, &name); err != nil {
+			return nil, err
+		}
+		return os.Getenv(name), nil
+	})
 	_ = s.ServeStream(context.Background(), os.Stdin, os.Stdout)
 }
 
@@ -116,6 +125,43 @@ func TestProcessTransportRoundTrip(t *testing.T) {
 	}
 	if echoed != "roundtrip" {
 		t.Errorf("echo = %q", echoed)
+	}
+}
+
+// TestProcessTransportExtraEnv verifies WithExtraEnv layers variables on top of
+// the inherited parent environment (rather than replacing it) and overrides
+// existing keys, without needing to re-pass the whole environment.
+func TestProcessTransportExtraEnv(t *testing.T) {
+	// A variable present in the parent environment: the child must still see it.
+	const parentProbe = "JSONRPC_TEST_PARENT_PROBE"
+	t.Setenv(parentProbe, "inherited")
+
+	transport, err := jsonrpc.NewProcessTransport(
+		os.Args[0], nil,
+		jsonrpc.WithExtraEnv(childEnvVar+"=1", parentProbe+"=overridden"),
+		jsonrpc.WithStderr(io.Discard),
+		jsonrpc.WithShutdownTimeout(2*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("spawn child: %v", err)
+	}
+	client := jsonrpc.NewClient(transport)
+	defer client.Close()
+
+	var v string
+	if err := client.Call(context.Background(), "env", parentProbe, &v); err != nil {
+		t.Fatalf("call env (parent probe): %v", err)
+	}
+	if v != "overridden" {
+		t.Errorf("extraEnv did not override parent var: got %q, want %q", v, "overridden")
+	}
+
+	// PATH is inherited from the parent; WithExtraEnv must not wipe it.
+	if err := client.Call(context.Background(), "env", "PATH", &v); err != nil {
+		t.Fatalf("call env (PATH): %v", err)
+	}
+	if v == "" {
+		t.Error("PATH was not inherited by the child; WithExtraEnv must preserve the parent environment")
 	}
 }
 

@@ -137,7 +137,7 @@ concurrent per-call fallback, so `CallBatch` is always safe to use.
 | ---------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | HTTP       | `NewHTTPTransport(url, ...)`           | Talk to an HTTP JSON-RPC endpoint. Options: `WithHTTPClient`, `WithHeader`.                                                   |
 | Stream     | `NewStreamTransport(in, out, ...)`     | Newline-delimited JSON over any reader/writer (pipes, sockets).                                                               |
-| Subprocess | `NewProcessTransport(name, args, ...)` | Spawn a command and speak JSON-RPC over its stdin/stdout. Options: `WithStderr`, `WithShutdownTimeout`, `WithEnv`, `WithDir`, `WithOnExit`. |
+| Subprocess | `NewProcessTransport(name, args, ...)` | Spawn a command and speak JSON-RPC over its stdin/stdout. Options: `WithStderr`, `WithShutdownTimeout`, `WithEnv`, `WithExtraEnv`, `WithDir`, `WithOnExit`. |
 
 The stream and subprocess transports run a background reader that correlates
 responses to calls by id, so many calls and notifications can be in flight
@@ -161,6 +161,19 @@ transport, err := jsonrpc.NewProcessTransport(serverCmd, args,
 The callback fires exactly once, asynchronously, after the child has been
 reaped; it must not block, and `Close` does not wait for it. Without it a caller
 only learns a spawned server has died when subsequent calls start failing.
+
+`WithEnv` and `WithExtraEnv` control the child's environment. `WithEnv` **replaces**
+the whole environment (os/exec `Cmd.Env` semantics — every variable, including
+`PATH`/`HOME`, must be listed). `WithExtraEnv` **merges** `KEY=VALUE` entries on
+top of the inherited parent environment, so it is the right choice for setting a
+few variables while keeping the rest intact; later values win for a repeated key.
+
+```go
+// Keep the parent environment; add/override a couple of variables.
+transport, _ := jsonrpc.NewProcessTransport(serverCmd, args,
+    jsonrpc.WithExtraEnv("LOG_LEVEL=debug", "DATA_DIR=/var/data"),
+)
+```
 
 ## Peer (bidirectional)
 
@@ -326,8 +339,8 @@ How it fits together:
 
 For a spawned subprocess peer, use `NewProcessPeer(name, args, server, opts...)`
 — the bidirectional counterpart to `NewProcessTransport`. It accepts the same
-process options (`WithStderr`, `WithEnv`, `WithDir`, `WithOnExit`,
-`WithShutdownTimeout`) and closing the Peer drives the child down. Unlike
+process options (`WithStderr`, `WithEnv`, `WithExtraEnv`, `WithDir`,
+`WithOnExit`, `WithShutdownTimeout`) and closing the Peer drives the child down. Unlike
 `NewPeer`, `NewProcessPeer` starts the background reader itself, so the returned
 Peer is ready to call immediately.
 

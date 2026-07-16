@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -280,7 +281,8 @@ type ProcessOption func(*processConfig)
 type processConfig struct {
 	stderr          io.Writer
 	shutdownTimeout time.Duration
-	env             []string
+	env             []string // full replacement environment (WithEnv); nil inherits parent
+	extraEnv        []string // additional KEY=VALUE merged on top (WithExtraEnv)
 	dir             string
 	onExit          func(error)
 }
@@ -298,8 +300,25 @@ func WithShutdownTimeout(d time.Duration) ProcessOption {
 }
 
 // WithEnv sets the environment for the child process (as in os/exec Cmd.Env).
+// It replaces the entire environment: every variable the child sees must be
+// listed, including PATH, HOME, etc. For the more common case of adding or
+// overriding a few variables while keeping the parent environment, use
+// [WithExtraEnv] instead.
 func WithEnv(env []string) ProcessOption {
 	return func(c *processConfig) { c.env = env }
+}
+
+// WithExtraEnv adds or overrides the given KEY=VALUE environment variables in
+// the child process's environment, on top of the environment it would
+// otherwise inherit (the parent's, or the full replacement set by [WithEnv]).
+// Entries use os.Environ's "KEY=VALUE" form. Multiple WithExtraEnv options
+// accumulate; for a repeated key the last value wins.
+//
+// Unlike [WithEnv] (which replaces the whole environment), WithExtraEnv keeps
+// the parent environment intact and only changes the listed variables — so
+// PATH, HOME, etc. are still available to the child.
+func WithExtraEnv(kv ...string) ProcessOption {
+	return func(c *processConfig) { c.extraEnv = append(c.extraEnv, kv...) }
 }
 
 // WithDir sets the working directory for the child process.
@@ -328,6 +347,43 @@ type spawnResult struct {
 	closeFn func() error
 }
 
+// mergeEnv builds the child process environment: base with each entry of extra
+// applied (KEY=VALUE), last value winning per key. A nil base means the child
+// inherits the parent environment ([os.Environ]); when extra is also empty
+// mergeEnv returns nil so the caller can leave [exec.Cmd].Env unset (full
+// inheritance). When extra is non-empty a nil base is expanded to os.Environ so
+// the listed variables layer on top of the parent environment rather than
+// replacing it.
+func mergeEnv(base, extra []string) []string {
+	if len(extra) == 0 {
+		return base // nil when unset -> child inherits parent; or the full replacement
+	}
+	if base == nil {
+		base = os.Environ()
+	}
+	out := make([]string, 0, len(base)+len(extra))
+	idx := make(map[string]int, len(base)+len(extra))
+	apply := func(kv string) {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if j, ok := idx[key]; ok {
+			out[j] = kv // override in place: last value wins
+		} else {
+			idx[key] = len(out)
+			out = append(out, kv)
+		}
+	}
+	for _, kv := range base {
+		apply(kv)
+	}
+	for _, kv := range extra {
+		apply(kv)
+	}
+	return out
+}
+
 // spawnProcess starts name with args and returns its stdin/stdout pipes plus a
 // close function that closes stdin, waits up to the shutdown timeout for the
 // child to exit, then kills it if necessary. A single background goroutine reaps
@@ -343,8 +399,8 @@ func spawnProcess(name string, args []string, opts []ProcessOption) (*spawnResul
 
 	cmd := exec.Command(name, args...)
 	cmd.Stderr = cfg.stderr
-	if cfg.env != nil {
-		cmd.Env = cfg.env
+	if merged := mergeEnv(cfg.env, cfg.extraEnv); merged != nil {
+		cmd.Env = merged
 	}
 	if cfg.dir != "" {
 		cmd.Dir = cfg.dir
