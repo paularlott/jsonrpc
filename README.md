@@ -388,6 +388,23 @@ batch — concurrently, serialising only the writes. Pass `WithSerialDispatch` t
 process messages one at a time in arrival order. The library is verified with
 `go test -race` and a fuzz target over `HandleMessage`.
 
+Concurrency is unbounded by default. A server exposed to untrusted clients
+should bound it:
+
+```go
+srv := jsonrpc.NewServer(
+    jsonrpc.WithMaxBatch(1000),                     // larger batches get one Invalid Request error
+    jsonrpc.WithMaxConcurrency(4*runtime.NumCPU()), // handlers running at once, server-wide
+)
+```
+
+`WithMaxConcurrency` is shared by every batch, HTTP request and stream the
+server handles. A batch runs on a worker pool no larger than the limit, a
+stream holds at most the limit of messages in flight, and a call that waits
+for a slot fails with "server busy" if its context ends first. A `Peer` still
+starts a goroutine per inbound request (blocking its reader could deadlock
+nested calls), but its handlers are held to the same limit.
+
 ## Examples
 
 Runnable programs live in [`examples/`](examples/):

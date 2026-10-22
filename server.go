@@ -24,8 +24,10 @@ type Server struct {
 	mu      sync.RWMutex
 	methods map[string]Handler
 
-	onError func(method string, err error)
-	serial  bool
+	onError  func(method string, err error)
+	serial   bool
+	maxBatch int           // 0 = no limit, see WithMaxBatch
+	slots    chan struct{} // nil = no limit, see WithMaxConcurrency
 }
 
 // Option configures a [Server].
@@ -43,6 +45,30 @@ func WithErrorHandler(fn func(method string, err error)) Option {
 // server dispatches each message (and each batch element) concurrently.
 func WithSerialDispatch() Option {
 	return func(s *Server) { s.serial = true }
+}
+
+// WithMaxBatch limits a batch to n elements. A larger batch is answered with a
+// single Invalid Request error and none of its elements run. A batch element
+// is tiny, so a request-size limit alone still lets one request carry
+// hundreds of thousands of calls. n <= 0 means no limit (the default).
+func WithMaxBatch(n int) Option {
+	return func(s *Server) { s.maxBatch = n }
+}
+
+// WithMaxConcurrency limits how many handlers run at once across the whole
+// server: batch elements, single requests and stream messages alike. Further
+// calls wait for a free slot (or for their context to end), and a batch or a
+// stream starts no more goroutines than the limit, so neither one large batch
+// nor many concurrent requests can run more than n handlers. n <= 0 means no
+// limit (the default).
+func WithMaxConcurrency(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.slots = make(chan struct{}, n)
+		} else {
+			s.slots = nil
+		}
+	}
 }
 
 // NewServer creates a Server with no methods registered.
@@ -131,8 +157,21 @@ func (s *Server) HandleRequest(ctx context.Context, req *Request) *Response {
 }
 
 // invoke runs a handler with panic recovery, reporting errors and panics to the
-// error hook when configured.
+// error hook when configured. Under WithMaxConcurrency it first waits for a
+// free slot; a context that ends while waiting is the call's error.
 func (s *Server) invoke(ctx context.Context, method string, h Handler, params json.RawMessage) (result any, err error) {
+	if s.slots != nil {
+		select {
+		case s.slots <- struct{}{}:
+			defer func() { <-s.slots }()
+		case <-ctx.Done():
+			err = InternalError("server busy: " + ctx.Err().Error())
+			if s.onError != nil {
+				s.onError(method, err)
+			}
+			return nil, err
+		}
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = InternalError(fmt.Sprintf("handler panic: %v", r))
@@ -204,6 +243,10 @@ func (s *Server) handleBatch(ctx context.Context, raw []byte) ([]byte, bool) {
 	if len(elems) == 0 {
 		return mustMarshal(newErrorResponse(nullID, InvalidRequest("empty batch"))), true
 	}
+	if s.maxBatch > 0 && len(elems) > s.maxBatch {
+		return mustMarshal(newErrorResponse(nullID, InvalidRequest(
+			fmt.Sprintf("batch too large: %d elements exceeds the limit of %d", len(elems), s.maxBatch)))), true
+	}
 	responses := s.dispatchBatch(ctx, elems)
 	if len(responses) == 0 {
 		return nil, false
@@ -230,16 +273,29 @@ func (s *Server) dispatchBatch(ctx context.Context, elems []json.RawMessage) []*
 		responses []*Response
 		wg        sync.WaitGroup
 	)
+	// Under WithMaxConcurrency a fixed set of workers drains the batch, so it
+	// never starts more goroutines than handlers may run at once.
+	workers := len(elems)
+	if s.slots != nil && cap(s.slots) < workers {
+		workers = cap(s.slots)
+	}
+	next := make(chan json.RawMessage, len(elems))
 	for _, elem := range elems {
+		next <- elem
+	}
+	close(next)
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func(elem json.RawMessage) {
+		go func() {
 			defer wg.Done()
-			if resp := s.dispatchElement(ctx, elem); resp != nil {
-				mu.Lock()
-				responses = append(responses, resp)
-				mu.Unlock()
+			for elem := range next {
+				if resp := s.dispatchElement(ctx, elem); resp != nil {
+					mu.Lock()
+					responses = append(responses, resp)
+					mu.Unlock()
+				}
 			}
-		}(elem)
+		}()
 	}
 	wg.Wait()
 	return responses
@@ -294,6 +350,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // loop.
 func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer) error {
 	decoder := json.NewDecoder(bufio.NewReader(in))
+	var inFlight chan struct{} // bounds messages in flight under WithMaxConcurrency
+	if s.slots != nil {
+		inFlight = make(chan struct{}, cap(s.slots))
+	}
 
 	var (
 		writeMu  sync.Mutex
@@ -340,6 +400,9 @@ func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer) e
 
 		process := func(msg json.RawMessage) {
 			defer wg.Done()
+			if inFlight != nil {
+				defer func() { <-inFlight }()
+			}
 			if resp, hasResponse := s.HandleMessage(ctx, msg); hasResponse {
 				writeLine(resp)
 			}
@@ -349,6 +412,11 @@ func (s *Server) ServeStream(ctx context.Context, in io.Reader, out io.Writer) e
 		if s.serial {
 			process(raw)
 		} else {
+			if inFlight != nil {
+				// Wait for a free slot before reading on, so a flood of
+				// messages queues in the stream rather than in goroutines.
+				inFlight <- struct{}{}
+			}
 			go process(raw)
 		}
 	}
