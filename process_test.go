@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -350,5 +352,28 @@ func TestProcessTransportOnExitSpontaneous(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("call after child exit hung")
+	}
+}
+
+// TestProcessClose_SIGTERMBeforeKill: a child that ignores EOF on stdin but
+// handles SIGTERM is terminated gracefully, before the hard kill.
+func TestProcessClose_SIGTERMBeforeKill(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("signals are not deliverable on Windows")
+	}
+	script := `trap 'exit 3' TERM; while :; do sleep 0.1; done`
+	tr, err := jsonrpc.NewProcessTransport("sh", []string{"-c", script},
+		jsonrpc.WithShutdownTimeout(200*time.Millisecond), jsonrpc.WithTermGrace(2*time.Second), jsonrpc.WithStderr(io.Discard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err = tr.Close()
+	if took := time.Since(start); took > 1500*time.Millisecond {
+		t.Fatalf("Close took %v: SIGTERM was not honoured before the kill", took)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Fatalf("exit = %v, want exit status 3 from the TERM handler", err)
 	}
 }

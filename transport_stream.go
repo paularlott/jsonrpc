@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -281,6 +282,7 @@ type ProcessOption func(*processConfig)
 type processConfig struct {
 	stderr          io.Writer
 	shutdownTimeout time.Duration
+	termGrace       time.Duration
 	env             []string // full replacement environment (WithEnv); nil inherits parent
 	extraEnv        []string // additional KEY=VALUE merged on top (WithExtraEnv)
 	dir             string
@@ -291,6 +293,13 @@ type processConfig struct {
 // inherited from the parent (os.Stderr). Pass io.Discard to silence it.
 func WithStderr(w io.Writer) ProcessOption {
 	return func(c *processConfig) { c.stderr = w }
+}
+
+// WithTermGrace sets how long Close waits for the child to exit after
+// sending it SIGTERM (once the shutdown timeout has passed with stdin
+// closed) before killing it outright. The default is 2 seconds.
+func WithTermGrace(d time.Duration) ProcessOption {
+	return func(c *processConfig) { c.termGrace = d }
 }
 
 // WithShutdownTimeout sets how long Close waits for the child to exit after its
@@ -392,7 +401,7 @@ func mergeEnv(base, extra []string) []string {
 // fires once after the child is reaped. cmd.Wait is called exactly once;
 // everything else coordinates through an internal channel.
 func spawnProcess(name string, args []string, opts []ProcessOption) (*spawnResult, error) {
-	cfg := processConfig{stderr: os.Stderr, shutdownTimeout: 5 * time.Second}
+	cfg := processConfig{stderr: os.Stderr, shutdownTimeout: 5 * time.Second, termGrace: 2 * time.Second}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -434,12 +443,23 @@ func spawnProcess(name string, args []string, opts []ProcessOption) (*spawnResul
 		case err := <-processDone:
 			return err
 		case <-time.After(cfg.shutdownTimeout):
-			// Child didn't exit gracefully: force-kill, then wait for the
-			// reaper goroutine to finish collecting its exit status so we
-			// never return before the child is fully reaped.
-			_ = cmd.Process.Kill()
-			return <-processDone
 		}
+		// Child didn't exit on EOF: escalate the way the MCP stdio
+		// transport describes (SIGTERM, then SIGKILL). SIGTERM lets the
+		// child run its own cleanup; where the platform cannot deliver it
+		// (Windows), fall straight through to the kill.
+		if err := cmd.Process.Signal(syscall.SIGTERM); err == nil {
+			select {
+			case err := <-processDone:
+				return err
+			case <-time.After(cfg.termGrace):
+			}
+		}
+		// Force-kill, then wait for the reaper goroutine to finish
+		// collecting its exit status so we never return before the child
+		// is fully reaped.
+		_ = cmd.Process.Kill()
+		return <-processDone
 	}
 
 	return &spawnResult{stdin: stdin, stdout: stdout, closeFn: closeFn}, nil
@@ -448,7 +468,8 @@ func spawnProcess(name string, args []string, opts []ProcessOption) (*spawnResul
 // NewProcessTransport spawns name with args as a JSON-RPC server speaking
 // newline-delimited JSON over its stdin/stdout, and returns a transport
 // connected to it. Closing the transport closes the child's stdin (signalling
-// it to exit), waits up to the shutdown timeout, then kills it if necessary.
+// it to exit), waits up to the shutdown timeout, then sends SIGTERM and,
+// after the term grace period, SIGKILL if necessary.
 // For a bidirectional connection use [NewProcessPeer] instead.
 func NewProcessTransport(name string, args []string, opts ...ProcessOption) (*StreamTransport, error) {
 	sp, err := spawnProcess(name, args, opts)
